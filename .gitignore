@@ -2,6 +2,7 @@
 work/
 work_tb_single/
 sim_work_single/
+lint_work/
 modelsim.ini
 transcript
 vsim.wlf
