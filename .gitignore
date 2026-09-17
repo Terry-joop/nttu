@@ -12,3 +12,6 @@ vish_stacktrace.vstf
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Local-only reference material
+architecture pictures/
