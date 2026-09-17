@@ -1,0 +1,14 @@
+# ModelSim generated libraries and runtime artifacts
+work/
+work_tb_single/
+sim_work_single/
+modelsim.ini
+transcript
+vsim.wlf
+vish_stacktrace.vstf
+*.mti
+
+# Editor and operating-system files
+.vscode/
+.DS_Store
+Thumbs.db

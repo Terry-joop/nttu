@@ -1,0 +1,340 @@
+// -----------------------------------------------------------------------------
+// top_2dntt_256x256_singlefile.v  (Verilog-2001)
+// Version : v1.7  (Verilog-2001 clean: no inner-block declarations)
+// Author  : you + assistant
+// -----------------------------------------------------------------------------
+// Topology:
+//   IN(16-lane) -> phase1_256pe
+//               -> global_xpose_pp_256x256  // RTL transpose; 2×(16-bank SRAM), XOR banking
+//               -> phase2_256pe
+//               -> OUT(16-lane)
+//
+// Notes:
+// - Memory is black-boxed ONLY for synthesis (define SYNTHESIS).
+//   In simulation (no SYNTHESIS), a working RAM model is used.
+// - Ping-pong buffers A/B let Phase-1 write and Phase-2 read run concurrently
+//   after the first full frame (4096 frames) is captured (warm-up).
+// - XOR banking: bank = row_lo ^ col_lo; addr = {R_hi, C_hi, C_lo}, DEPTH=4096 per bank.
+// - Set MEM_READ_LAT to your SRAM macro read latency (cycles). Must be >= 1.
+// -----------------------------------------------------------------------------
+
+`include "ntt_params.vh"
+`default_nettype none
+
+// ===== TOP ===================================================================
+module top_2dntt_256x256 #(
+    parameter integer WORD_WIDTH   = `NTT_WORD_WIDTH, // e.g., 60
+    parameter integer LANES        = `LANES,          // 16
+    parameter integer MEM_READ_LAT = 1                // SRAM read latency (>=1)
+)(
+    input  wire                         clk,
+    input  wire                         rst_n,
+
+    // Level/bank selector (pass-through to both PEs)
+    input  wire [`NTT_BANK_BITS-1:0]    bank_id,
+
+    // Frame-stream IN (16 lanes / cycle)
+    input  wire                         in_valid,
+    input  wire [LANES*WORD_WIDTH-1:0]  in_data,
+
+    // Frame-stream OUT
+    output wire                         out_valid,
+    output wire [LANES*WORD_WIDTH-1:0]  out_data
+);
+// -------------------- Phase-1 (real module) ------------------------------
+    wire                          v_p1;
+    wire [LANES*WORD_WIDTH-1:0]   d_p1;
+
+    phase1_256pe U_P1 (
+        .clk      (clk),
+        .rst_n    (rst_n),
+        .bank_id  (bank_id),
+        .in_valid (in_valid),
+        .in_data  (in_data),
+        .out_valid(v_p1),
+        .out_data (d_p1)
+    );
+// -------------------- Global transpose (ping-pong; RTL+BB SRAM) ----------
+    wire                          v_mid;
+    wire [LANES*WORD_WIDTH-1:0]   d_mid;
+
+    global_xpose_pp_256x256 #(
+        .WORD_WIDTH   (WORD_WIDTH),
+        .LANES        (LANES),
+        .FRAME_DIM    (256),
+        .MEM_READ_LAT (MEM_READ_LAT)     // must be >=1
+    ) U_XPOSE (
+        .clk     (clk),
+        .rst_n   (rst_n),
+        .s_valid (v_p1),
+        .s_data  (d_p1),
+        .m_valid (v_mid),
+        .m_data  (d_mid)
+    );
+// -------------------- Phase-2 (real module) ------------------------------
+    phase2_256pe U_P2 (
+        .clk        (clk),
+        .rst_n      (rst_n),
+        .bank_id    (bank_id),
+        .in_valid   (v_mid),
+        .in_data_vec(d_mid),      // <-- ??? ??
+        .out_valid  (out_valid),
+        .out_data   (out_data)
+    );
+endmodule
+
+
+// ===== Global transpose (ping-pong) ==========================================
+// - Full-frame (256×256) transpose with ping-pong buffers A/B.
+// - Memory arrays are black-box single-port banks: sram_bank_1p
+// - Write to one set while reading the other set (II=1 after warmup).
+module global_xpose_pp_256x256 #(
+    parameter integer WORD_WIDTH   = 60,
+    parameter integer LANES        = 16,
+    parameter integer FRAME_DIM    = 256,   // 256x256
+    parameter integer MEM_READ_LAT = 1      // SRAM read latency (>=1)
+)(
+    input  wire                         clk,
+    input  wire                         rst_n,
+    // in: ROW_MAJOR frames from Phase-1 (frame = 16 lanes)
+    input  wire                         s_valid,
+    input  wire [LANES*WORD_WIDTH-1:0]  s_data,
+    // out: globally transposed frames to Phase-2
+    output wire                         m_valid,
+    output wire [LANES*WORD_WIDTH-1:0]  m_data
+);
+    localparam integer TOTAL_FRAMES = (FRAME_DIM*FRAME_DIM)/LANES; // 4096
+    localparam integer ADDR_W       = 12; // log2(4096)
+    localparam integer DIM_W        = 8;  // log2(256)
+
+    // ===== Loop indices (Verilog-2001: declare at module scope) ==============
+    integer i;
+    integer wl;  // write-lane loop
+    integer rl;  // read-lane loop
+    integer vp;  // vpipe loop
+    integer pl;  // pack loop
+    integer qi;  // mdata_q pipe loop
+
+    // FSM
+    localparam [1:0] ST_FILL_A = 2'd0,
+                     ST_AB     = 2'd1,    // drain A + fill B
+                     ST_BA     = 2'd2;    // drain B + fill A
+    reg [1:0] st, st_n;
+    // A/B capture/drain frame indices
+    reg [ADDR_W-1:0] capA, capB; // frames written
+    reg [ADDR_W-1:0] drnA, drnB; // frames read
+
+    // ---- Write mapping (ROW_MAJOR) ----
+    // frame f -> R=f/16, q=f%16, C_base = 16*q
+    // R = 16*R_hi + R_lo, C = 16*C_hi + C_lo(lane)
+    // bank = R_lo ^ C_lo(lane) = R_lo ^ lane
+    // addr = { R_hi, C_hi, C_lo(lane) }
+    wire [DIM_W-1:0]  R_fillA = capA / 16;
+    wire [3:0]        Rhi_A   = R_fillA[7:4];
+    wire [3:0]        Rlo_A   = R_fillA[3:0];
+    wire [3:0]        Chi_A   = capA[3:0];
+    wire [DIM_W-1:0]  R_fillB = capB / 16;
+    wire [3:0]        Rhi_B   = R_fillB[7:4];
+    wire [3:0]        Rlo_B   = R_fillB[3:0];
+    wire [3:0]        Chi_B   = capB[3:0];
+    // ---- Read mapping (transpose order) ----
+    // out frame g -> rT=g/16 = 16*C_hi + C_lo,  cT_base=(g%16)*16 = 16*R_hi
+    // lane l : A^T[rT, cT_base+l] = A[cT_base+l, rT]
+    // bank = (l ^ C_lo), addr = { R_hi(row), C_hi(col), C_lo(col) }
+    wire [DIM_W-1:0]  rT_A    = drnA / 16;
+    wire [3:0]        Chi_rA  = rT_A[7:4];
+    wire [3:0]        Clo_rA  = rT_A[3:0];
+    wire [3:0]        Rhi_rA  = drnA[3:0];
+    wire [DIM_W-1:0]  rT_B    = drnB / 16;
+    wire [3:0]        Chi_rB  = rT_B[7:4];
+    wire [3:0]        Clo_rB  = rT_B[3:0];
+    wire [3:0]        Rhi_rB  = drnB[3:0];
+    // ---------------- Bank arrays (A/B) ----------------
+    genvar bi;
+    reg                  weA   [0:LANES-1], weB   [0:LANES-1];
+    reg  [ADDR_W-1:0]    waddrA[0:LANES-1], waddrB[0:LANES-1];
+    reg  [WORD_WIDTH-1:0]wdataA[0:LANES-1], wdataB[0:LANES-1];
+    reg                  reA   [0:LANES-1], reB   [0:LANES-1];
+    reg  [ADDR_W-1:0]    raddrA[0:LANES-1], raddrB[0:LANES-1];
+    wire [WORD_WIDTH-1:0]rdataA[0:LANES-1], rdataB[0:LANES-1];
+
+    // Combinational write/read gen
+    always @(*) begin
+        for (i=0; i<LANES; i=i+1) begin
+            weA[i]=1'b0; waddrA[i]={ADDR_W{1'b0}}; wdataA[i]={WORD_WIDTH{1'b0}};
+            weB[i]=1'b0; waddrB[i]={ADDR_W{1'b0}}; wdataB[i]={WORD_WIDTH{1'b0}};
+            reA[i]=1'b0; raddrA[i]={ADDR_W{1'b0}};
+            reB[i]=1'b0; raddrB[i]={ADDR_W{1'b0}};
+        end
+
+        if (s_valid) begin
+            if (st==ST_FILL_A || st==ST_BA) begin
+                for (wl=0; wl<LANES; wl=wl+1) begin
+                    weA   [ Rlo_A ^ wl ] = 1'b1;
+                    waddrA[ Rlo_A ^ wl ] = { Rhi_A, Chi_A, wl[3:0] };
+                    wdataA[ Rlo_A ^ wl ] = s_data[(wl+1)*WORD_WIDTH-1 -: WORD_WIDTH];
+                end
+            end else if (st==ST_AB) begin
+                for (wl=0; wl<LANES; wl=wl+1) begin
+                    weB   [ Rlo_B ^ wl ] = 1'b1;
+                    waddrB[ Rlo_B ^ wl ] = { Rhi_B, Chi_B, wl[3:0] };
+                    wdataB[ Rlo_B ^ wl ] = s_data[(wl+1)*WORD_WIDTH-1 -: WORD_WIDTH];
+                end
+            end
+        end
+
+        if (st==ST_AB) begin
+            for (rl=0; rl<LANES; rl=rl+1) begin
+                reA   [ rl ^ Clo_rA ] = 1'b1;
+                raddrA[ rl ^ Clo_rA ] = { Rhi_rA, Chi_rA, Clo_rA };
+            end
+        end else if (st==ST_BA) begin
+            for (rl=0; rl<LANES; rl=rl+1) begin
+                reB   [ rl ^ Clo_rB ] = 1'b1;
+                raddrB[ rl ^ Clo_rB ] = { Rhi_rB, Chi_rB, Clo_rB };
+            end
+        end
+    end
+
+    // 16 banks × 2 sets
+    generate
+        for (bi=0; bi<LANES; bi=bi+1) begin : G_BANKS
+            sram_bank_1p #(
+                .WORD_WIDTH(WORD_WIDTH), .DEPTH(4096), .ADDR_W(ADDR_W), .READ_LAT(MEM_READ_LAT)
+            ) U_BANK_A (
+                 .clk(clk), .rst_n(rst_n),
+                .we(weA[bi]), .waddr(waddrA[bi]), .wdata(wdataA[bi]),
+                .re(reA[bi]), .raddr(raddrA[bi]), .rdata(rdataA[bi])
+            );
+            sram_bank_1p #(
+                .WORD_WIDTH(WORD_WIDTH), .DEPTH(4096), .ADDR_W(ADDR_W), .READ_LAT(MEM_READ_LAT)
+            ) U_BANK_B (
+                .clk(clk), .rst_n(rst_n),
+                .we(weB[bi]), .waddr(waddrB[bi]), .wdata(wdataB[bi]),
+                .re(reB[bi]), .raddr(raddrB[bi]), .rdata(rdataB[bi])
+            );
+        end
+    endgenerate
+
+    // Read-latency align & lane repack
+    reg [MEM_READ_LAT:0] vpipe;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) vpipe <= {(MEM_READ_LAT+1){1'b0}};
+        else begin
+            vpipe[0] <= (st==ST_AB) | (st==ST_BA);
+            for (vp=1; vp<=MEM_READ_LAT; vp=vp+1)
+                vpipe[vp] <= vpipe[vp-1];
+        end
+    end
+    assign m_valid = vpipe[MEM_READ_LAT];
+
+    reg [LANES*WORD_WIDTH-1:0] mdata_r;
+    reg [LANES*WORD_WIDTH-1:0] mdata_q [0:MEM_READ_LAT-1];
+    // MEM_READ_LAT >= 1 assumed
+    always @(*) begin
+        mdata_r = {LANES*WORD_WIDTH{1'b0}};
+        if (st==ST_AB) begin
+            for (pl=0; pl<LANES; pl=pl+1)
+                mdata_r[(pl+1)*WORD_WIDTH-1 -: WORD_WIDTH] = rdataA[ pl ^ Clo_rA ];
+        end else if (st==ST_BA) begin
+            for (pl=0; pl<LANES; pl=pl+1)
+                mdata_r[(pl+1)*WORD_WIDTH-1 -: WORD_WIDTH] = rdataB[ pl ^ Clo_rB ];
+        end
+    end
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            for (qi=0; qi<MEM_READ_LAT; qi=qi+1)
+                mdata_q[qi] <= {LANES*WORD_WIDTH{1'b0}};
+        end else begin
+            // MEM_READ_LAT >=1 guarantees at least one stage
+            mdata_q[0] <= mdata_r;
+            for (qi=1; qi<MEM_READ_LAT; qi=qi+1)
+                mdata_q[qi] <= mdata_q[qi-1];
+        end
+    end
+    assign m_data = mdata_q[MEM_READ_LAT-1];
+    // FSM & counters
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) st <= ST_FILL_A;
+        else        st <= st_n;
+    end
+    wire capA_done = (capA == TOTAL_FRAMES-1) && s_valid;
+    wire capB_done = (capB == TOTAL_FRAMES-1) && s_valid;
+    wire drnA_done = (drnA == TOTAL_FRAMES-1);
+    wire drnB_done = (drnB == TOTAL_FRAMES-1);
+    always @(*) begin
+        case (st)
+            ST_FILL_A: st_n = capA_done ? ST_AB : ST_FILL_A;
+            ST_AB    : st_n = (drnA_done && capB_done) ? ST_BA : ST_AB;
+            ST_BA    : st_n = (drnB_done && capA_done) ? ST_AB : ST_BA;
+            default  : st_n = ST_FILL_A;
+        endcase
+    end
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            capA <= 0; capB <= 0; drnA <= 0; drnB <= 0;
+        end else begin
+            case (st)
+                ST_FILL_A: begin
+                    drnA <= 0; drnB <= 0; capB <= 0;
+                    if (s_valid) capA <= capA + 1'b1;
+                end
+                ST_AB: begin
+                    if (s_valid) capB <= capB + 1'b1;
+                    drnA <= drnA + 1'b1;
+                    if (drnA_done && capB_done) begin capA <= 0; drnA <= 0; end
+                end
+                ST_BA: begin
+                    if (s_valid) capA <= capA + 1'b1;
+                    drnB <= drnB + 1'b1;
+                    if (drnB_done && capA_done) begin capB <= 0; drnB <= 0; end
+                end
+            endcase
+        end
+    end
+endmodule
+
+
+// ===== Black-box SRAM bank (1-port). Synth=BB / Sim=working model ============
+module sram_bank_1p #(
+    parameter integer WORD_WIDTH = 60,
+    parameter integer DEPTH      = 4096,
+    parameter integer ADDR_W     = 12,
+    parameter integer READ_LAT   = 1
+)(
+    input  wire                   clk,
+    input  wire                   rst_n,
+    // write
+    input  wire                   we,
+    input  wire [ADDR_W-1:0]      waddr,
+    input  wire [WORD_WIDTH-1:0]  wdata,
+    // read
+    input  wire                   re,
+    input  wire [ADDR_W-1:0]      raddr,
+    output wire [WORD_WIDTH-1:0]  rdata
+);
+`ifdef SYNTHESIS
+    // synthesis syn_black_box
+    (* black_box = "true", syn_black_box = 1, keep_hierarchy = "yes" *)
+`else
+    // Working simulation model (READ_LAT >=1)
+    reg [WORD_WIDTH-1:0] mem [0:DEPTH-1];
+    reg [ADDR_W-1:0] raddr_q [0:READ_LAT-1];
+    integer ii;
+    always @(posedge clk) begin
+        if (we) mem[waddr] <= wdata;
+    end
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            for (ii=0; ii<READ_LAT; ii=ii+1) raddr_q[ii] <= {ADDR_W{1'b0}};
+        end else if (re) begin
+            raddr_q[0] <= raddr;
+            for (ii=1; ii<READ_LAT; ii=ii+1) raddr_q[ii] <= raddr_q[ii-1];
+        end
+    end
+    assign rdata = mem[raddr_q[READ_LAT-1]];
+`endif
+endmodule
+
+`default_nettype wire

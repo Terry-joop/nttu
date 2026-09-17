@@ -1,0 +1,109 @@
+// -----------------------------------------------------------------------------
+// shoup_mult.v (Verilog-2001)
+// Version : v2.0e-mod // valid_out timing fixed
+// Purpose : Shoup modular multiply by "ratio" using precomputed z_pre
+// Formula : res = (a*ratio - floor(a*z_pre / 2^K) * q) mod q
+// Notes   : - II = 1 (new input each cycle)
+//           - WORD_WIDTH and K_WIDTH default to 64 (vectors are 2^64-based)
+//           - result is aligned with valid_out in the SAME cycle
+// -----------------------------------------------------------------------------
+`include "ntt_params.vh"
+module shoup_mult #(
+    parameter WORD_WIDTH = `NTT_WORD_WIDTH,
+    parameter K_WIDTH    = `NTT_WORD_WIDTH
+)(
+    input  wire                  clk,
+    input  wire                  rst_n,
+
+    input  wire                  valid_in,
+    input  wire [WORD_WIDTH-1:0] a,
+    input  wire [WORD_WIDTH-1:0] ratio,
+    input  wire [WORD_WIDTH-1:0] z_pre,    // floor(ratio * 2^K / q)
+    input  wire [WORD_WIDTH-1:0] q,
+
+    output reg                   valid_out, // MODIFIED: wire -> reg
+    output reg  [WORD_WIDTH-1:0] result
+);
+
+    // -----------------------------
+    // Valid pipeline (2 stages)
+    // -----------------------------
+    reg vld_s1;
+    always @(posedge clk or negedge rst_n) begin
+        if(!rst_n) begin
+            vld_s1 <= 1'b0;
+        end else begin
+            vld_s1 <= valid_in;
+        end
+    end
+
+    // MODIFICATION START
+    // assign valid_out = vld_s1; // DELETED: This line is removed
+    
+    // ADDED: Register vld_s1 one more cycle to align with the result
+    always @(posedge clk or negedge rst_n) begin
+        if(!rst_n) begin
+            valid_out <= 1'b0;
+        end else begin
+            valid_out <= vld_s1;
+        end
+    end
+    // MODIFICATION END
+
+    // -----------------------------
+    // Stage 1: products and capture
+    // -----------------------------
+    reg  [2*WORD_WIDTH-1:0] AR_s1;      // a * ratio (full 2W bits)
+    reg  [WORD_WIDTH-1:0]   q_s1;       // delayed q
+    reg  [WORD_WIDTH-1:0]   q_est_s1;   // floor(a * z_pre / 2^K)
+
+    wire [2*WORD_WIDTH-1:0] a_mul_ratio = a * ratio;
+    wire [2*WORD_WIDTH-1:0] a_mul_zpre  = a * z_pre;
+
+    always @(posedge clk or negedge rst_n) begin
+        if(!rst_n) begin
+            AR_s1     <= {2*WORD_WIDTH{1'b0}};
+            q_s1      <= {WORD_WIDTH{1'b0}};
+            q_est_s1  <= {WORD_WIDTH{1'b0}};
+        end else if (valid_in) begin
+            AR_s1     <= a_mul_ratio;
+            q_s1      <= q;
+            q_est_s1  <= a_mul_zpre[2*WORD_WIDTH-1:WORD_WIDTH]; // >> K (K==WORD_WIDTH)
+        end
+    end
+
+    // -----------------------------
+    // Stage 2: robust reduction
+    // -----------------------------
+    wire [2*WORD_WIDTH-1:0] qmul = q_est_s1 * q_s1;
+
+    // signed 2W+1 subtraction to detect negativity
+    wire [2*WORD_WIDTH:0]   T = {1'b0, AR_s1} - {1'b0, qmul};
+
+    // if negative, add q once
+    wire [2*WORD_WIDTH:0]   U0 = T[2*WORD_WIDTH]
+                                 ? (T + { {(2*WORD_WIDTH+1-WORD_WIDTH){1'b0}}, q_s1 })
+                                 : T;
+
+    // subtract q once if still >= q
+    wire [2*WORD_WIDTH:0]   U1_try = U0 - { {(2*WORD_WIDTH+1-WORD_WIDTH){1'b0}}, q_s1 };
+    wire                    ge0_1  = ~U1_try[2*WORD_WIDTH];
+    wire [2*WORD_WIDTH:0]   U1     = ge0_1 ? U1_try : U0;
+
+    // optional: subtract q again if still >= q (safety)
+    wire [2*WORD_WIDTH:0]   U2_try = U1 - { {(2*WORD_WIDTH+1-WORD_WIDTH){1'b0}}, q_s1 };
+    wire                    ge0_2  = ~U2_try[2*WORD_WIDTH];
+    wire [2*WORD_WIDTH:0]   U2     = ge0_2 ? U2_try : U1;
+
+    // Output register aligned to valid_out
+    always @(posedge clk or negedge rst_n) begin
+        if(!rst_n) begin
+            result <= {WORD_WIDTH{1'b0}};
+        end else begin
+            // latch Stage-2 comb result when Stage-1 valid is high
+            if (vld_s1) result <= U2[WORD_WIDTH-1:0];
+            // present final result exactly when valid_out asserts
+        end
+    end
+
+endmodule
