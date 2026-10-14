@@ -286,8 +286,9 @@ module tb_ntt16_barrett;
 
         // ---- Loop banks ----
         for (lvl = BANK_LO; lvl <= BANK_HI; lvl = lvl + 1) begin
-            stim_path = {BASEDIR, "/level", itoa2(lvl), "/ntt16_stim.hex"};
-            exp_path  = {BASEDIR, "/level", itoa2(lvl), "/ntt16_exp_bitrev.hex"};
+            // Vector directories are named level0..level29 (not level00..level29).
+            $sformat(stim_path, "%0s/level%0d/ntt16_stim.hex", BASEDIR, lvl);
+            $sformat(exp_path,  "%0s/level%0d/ntt16_exp_bitrev.hex", BASEDIR, lvl);
 
             stim_fd = $fopen(stim_path, "r");
             exp_fd  = $fopen(exp_path,  "r");
